@@ -4,7 +4,15 @@
   Data are stored in localStorage during the session and downloaded locally at the end.
 */
 
-const APP_VERSION = "1.2.0";
+const APP_VERSION = "1.4.0";
+
+// Google Sheets integration
+// Paste the deployed Google Apps Script Web App URL here.
+// The included google_apps_script.gs file contains the server code.
+const GOOGLE_SHEETS_WEB_APP_URL = "https://script.google.com/macros/s/AKfycbz2ljtK7mknSoteIR5Nnklcq-oEDLQyp0uu8pE_VziX-bocXHxnSDc90gSMYvgOGRzc-Q/exec";
+const GOOGLE_SHEETS_CONFIGURED = GOOGLE_SHEETS_WEB_APP_URL && !GOOGLE_SHEETS_WEB_APP_URL.includes("PASTE_GOOGLE_APPS_SCRIPT");
+const REQUIRE_GOOGLE_SHEETS_RESERVATION = true;
+
 const STORAGE_KEY_PREFIX = "syllogism_mouse_session_";
 const PHASES = {
   WELCOME: "welcome",
@@ -154,6 +162,36 @@ const practiceStimulus = {
   correct_answer: "YES",
 };
 
+/*
+  Counterbalancing method:
+  The original experiment did not use full randomization. It used Latin-square counterbalancing.
+  This implementation therefore creates structured trial orders:
+  - two belief-laden blocks, each containing one item in each belief x validity cell
+  - one neutral block containing the four neutral items
+  - the belief/validity condition order is Latin-square counterbalanced
+  - the neutral block order is Latin-square counterbalanced
+  - the neutral block appears either first or last
+  - the two conclusion-form blocks are also alternated to avoid always placing one conclusion form earlier
+*/
+const LATIN_BELIEF_VALIDITY_ORDERS = [
+  ["believable_valid", "unbelievable_valid", "believable_invalid", "unbelievable_invalid"],
+  ["unbelievable_valid", "believable_invalid", "unbelievable_invalid", "believable_valid"],
+  ["believable_invalid", "unbelievable_invalid", "believable_valid", "unbelievable_valid"],
+  ["unbelievable_invalid", "believable_valid", "unbelievable_valid", "believable_invalid"],
+];
+
+const LATIN_NEUTRAL_ORDERS = [
+  ["T02", "T04", "T08", "T10"],
+  ["T04", "T08", "T10", "T02"],
+  ["T08", "T10", "T02", "T04"],
+  ["T10", "T02", "T04", "T08"],
+];
+
+const CONCLUSION_FORM_BLOCKS = {
+  some_c_not_a: "Some C are not A",
+  some_a_not_c: "Some A are not C",
+};
+
 const app = document.getElementById("app");
 
 let state = makeInitialState();
@@ -176,9 +214,9 @@ let automaticDownloadAttempted = false;
 function makeInitialState() {
   const params = new URLSearchParams(window.location.search);
   const requestedCondition = params.get("condition");
-  const assignedCondition = requestedCondition === "soft" || requestedCondition === "strict"
+  const forcedCondition = requestedCondition === "soft" || requestedCondition === "strict"
     ? requestedCondition
-    : Math.random() < 0.5 ? "soft" : "strict";
+    : null;
   const now = new Date();
   const participantId = `P_${formatTimestamp(now)}_${randomString(5)}`;
   const sessionId = `S_${formatTimestamp(now)}_${randomString(8)}`;
@@ -186,7 +224,13 @@ function makeInitialState() {
     app_version: APP_VERSION,
     participant_id: participantId,
     session_id: sessionId,
-    assigned_condition: assignedCondition,
+    participant_number: null,
+    assigned_condition: forcedCondition,
+    forced_condition_from_url: forcedCondition,
+    google_sheets_configured: GOOGLE_SHEETS_CONFIGURED,
+    google_sheets_reservation_status: "not_started",
+    google_sheets_completion_status: "not_started",
+    google_sheets_error: "",
     current_screen: PHASES.WELCOME,
     experiment_start_time: now.toISOString(),
     experiment_end_time: null,
@@ -194,11 +238,19 @@ function makeInitialState() {
     consent: false,
     demographics: {},
     randomized_trial_order: [],
+    presentation_order_method: "latin_square_counterbalancing",
+    counterbalance_index: null,
+    belief_condition_order_index: null,
+    neutral_order_index: null,
+    neutral_block_position: null,
+    conclusion_block_order: null,
     current_trial_position: 0,
     trial_data: [],
     click_events: [],
     mouse_samples: [],
     browser_info: getBrowserInfo(),
+    full_json_filename: "",
+    trial_csv_filename: "",
     download_status: "not_started",
   };
 }
@@ -487,13 +539,198 @@ function renderDemographics() {
       </div>
     </section>
   `;
-  document.getElementById("demoForm").addEventListener("submit", (event) => {
+  document.getElementById("demoForm").addEventListener("submit", async (event) => {
     event.preventDefault();
+    const submitButton = event.target.querySelector('button[type="submit"]') || document.querySelector('button[form="demoForm"]');
     const fd = new FormData(event.target);
     state.demographics = Object.fromEntries(fd.entries());
-    state.current_screen = PHASES.INSTRUCTIONS;
+    if (submitButton) {
+      submitButton.disabled = true;
+      submitButton.textContent = "Registering...";
+    }
+    try {
+      await reserveParticipantAssignment();
+      state.current_screen = PHASES.INSTRUCTIONS;
+      persistSession();
+      render();
+    } catch (error) {
+      state.google_sheets_error = error.message || String(error);
+      persistSession();
+      const existing = document.getElementById("reservationError");
+      if (existing) existing.remove();
+      const errorBox = document.createElement("p");
+      errorBox.id = "reservationError";
+      errorBox.className = "error";
+      errorBox.textContent = `Could not register this participant in the shared Google Sheet: ${state.google_sheets_error}`;
+      document.querySelector(".screen").appendChild(errorBox);
+      if (submitButton) {
+        submitButton.disabled = false;
+        submitButton.textContent = "Try again";
+      }
+    }
+  });
+}
+
+
+function reserveParticipantAssignment() {
+  if (state.assigned_condition && state.participant_number) {
+    return Promise.resolve({ already_reserved: true });
+  }
+
+  if (!GOOGLE_SHEETS_CONFIGURED) {
+    state.google_sheets_reservation_status = "not_configured";
+    if (REQUIRE_GOOGLE_SHEETS_RESERVATION) {
+      throw new Error("Google Sheets Web App URL is not configured in app.js.");
+    }
+    const fallback = makeLocalFallbackAssignment();
+    applyReservationResponse(fallback);
+    return Promise.resolve(fallback);
+  }
+
+  state.google_sheets_reservation_status = "pending";
+  persistSession();
+
+  const params = {
+    action: "reserve",
+    participant_id: state.participant_id,
+    session_id: state.session_id,
+    forced_condition: state.forced_condition_from_url || "",
+    participant_code: state.demographics.participant_code || "",
+    demographics_json: JSON.stringify(state.demographics || {}),
+    browser_json: JSON.stringify(state.browser_info || {}),
+    app_version: APP_VERSION,
+  };
+
+  return jsonpRequest(GOOGLE_SHEETS_WEB_APP_URL, params).then((response) => {
+    if (!response || response.ok !== true) {
+      throw new Error(response && response.error ? response.error : "Reservation failed.");
+    }
+    applyReservationResponse(response);
+    return response;
+  });
+}
+
+function applyReservationResponse(response) {
+  state.participant_number = Number(response.participant_number) || state.participant_number;
+  state.assigned_condition = response.assigned_condition || state.assigned_condition;
+  state.google_sheets_reservation_status = response.source === "local_fallback" ? "local_fallback" : "reserved";
+  state.google_sheets_error = "";
+  persistSession();
+}
+
+function makeLocalFallbackAssignment() {
+  const fallbackNumber = getParticipantOrderNumberFromCode();
+  const fallbackCondition = state.forced_condition_from_url || (Math.random() < 0.5 ? "soft" : "strict");
+  return {
+    ok: true,
+    source: "local_fallback",
+    participant_number: fallbackNumber,
+    assigned_condition: fallbackCondition,
+  };
+}
+
+function jsonpRequest(baseUrl, params, timeoutMs = 12000) {
+  return new Promise((resolve, reject) => {
+    const callbackName = `gsCallback_${Date.now()}_${randomString(6)}`;
+    const script = document.createElement("script");
+    const url = new URL(baseUrl);
+    Object.entries(params || {}).forEach(([key, value]) => url.searchParams.set(key, value == null ? "" : String(value)));
+    url.searchParams.set("callback", callbackName);
+
+    let done = false;
+    const cleanup = () => {
+      try { delete window[callbackName]; } catch (_) { window[callbackName] = undefined; }
+      if (script.parentNode) script.parentNode.removeChild(script);
+    };
+
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      cleanup();
+      reject(new Error("Google Sheets reservation timed out."));
+    }, timeoutMs);
+
+    window[callbackName] = (data) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      cleanup();
+      resolve(data);
+    };
+
+    script.onerror = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      cleanup();
+      reject(new Error("Could not reach the Google Sheets Web App."));
+    };
+
+    script.src = url.toString();
+    document.body.appendChild(script);
+  });
+}
+
+function postToGoogleSheets(payload) {
+  if (!GOOGLE_SHEETS_CONFIGURED) return Promise.resolve(false);
+  const body = JSON.stringify(payload);
+
+  if (navigator.sendBeacon) {
+    try {
+      const blob = new Blob([body], { type: "text/plain;charset=utf-8" });
+      const accepted = navigator.sendBeacon(GOOGLE_SHEETS_WEB_APP_URL, blob);
+      if (accepted) return Promise.resolve(true);
+    } catch (error) {
+      console.warn("sendBeacon failed, falling back to fetch", error);
+    }
+  }
+
+  return fetch(GOOGLE_SHEETS_WEB_APP_URL, {
+    method: "POST",
+    mode: "no-cors",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body,
+    keepalive: true,
+  }).then(() => true).catch((error) => {
+    console.warn("Google Sheets POST failed", error);
+    return false;
+  });
+}
+
+function syncCompletionToGoogleSheets() {
+  if (state.google_sheets_completion_status === "upload_attempted" || state.google_sheets_completion_status === "upload_sent") return;
+  if (!GOOGLE_SHEETS_CONFIGURED) {
+    state.google_sheets_completion_status = "not_configured";
     persistSession();
-    render();
+    return;
+  }
+
+  state.google_sheets_completion_status = "upload_attempted";
+  persistSession();
+
+  const payload = {
+    action: "complete",
+    participant_number: state.participant_number,
+    participant_id: state.participant_id,
+    participant_code: state.demographics.participant_code || "",
+    session_id: state.session_id,
+    assigned_condition: state.assigned_condition,
+    app_version: APP_VERSION,
+    completion_status: state.completion_status,
+    experiment_start_time: state.experiment_start_time,
+    experiment_end_time: state.experiment_end_time,
+    full_json_filename: state.full_json_filename,
+    trial_csv_filename: state.trial_csv_filename,
+    demographics: state.demographics,
+    browser_info: state.browser_info,
+    presentation_order_method: state.presentation_order_method,
+    counterbalance_index: state.counterbalance_index,
+    trial_data: state.trial_data,
+  };
+
+  postToGoogleSheets(payload).then((sent) => {
+    state.google_sheets_completion_status = sent ? "upload_sent" : "upload_failed";
+    persistSession();
   });
 }
 
@@ -591,9 +828,112 @@ function renderPracticeFeedback() {
   });
 }
 
+
+function getParticipantOrderNumber() {
+  const participantNumber = Number(state.participant_number);
+  if (Number.isFinite(participantNumber) && participantNumber > 0) return participantNumber - 1;
+  return getParticipantOrderNumberFromCode() - 1;
+}
+
+function getParticipantOrderNumberFromCode() {
+  const code = String(state.demographics.participant_code || "").trim();
+  const digitMatch = code.match(/\d+/);
+  if (digitMatch) {
+    const parsed = parseInt(digitMatch[0], 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return stableStringHash(code || state.participant_id) + 1;
+}
+
+function stableStringHash(value) {
+  const str = String(value || "");
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
+
+function buildLatinSquareTrialOrder() {
+  const orderNumber = getParticipantOrderNumber();
+
+  // 16 schedules = 4 Latin condition orders x 2 neutral-block positions x 2 conclusion-block orders.
+  const counterbalanceIndex = orderNumber % 16;
+  const beliefConditionOrderIndex = counterbalanceIndex % 4;
+  const neutralOrderIndex = Math.floor(counterbalanceIndex / 2) % 4;
+  const neutralFirst = Math.floor(counterbalanceIndex / 4) % 2 === 0;
+  const cThenA = Math.floor(counterbalanceIndex / 8) % 2 === 0;
+
+  const conditionOrder = LATIN_BELIEF_VALIDITY_ORDERS[beliefConditionOrderIndex];
+  const neutralOrder = LATIN_NEUTRAL_ORDERS[neutralOrderIndex];
+
+  const someCBlock = conditionOrder.map((conditionKey) =>
+    findStimulusByConditionKey(conditionKey, CONCLUSION_FORM_BLOCKS.some_c_not_a)
+  );
+
+  const someABlock = conditionOrder.map((conditionKey) =>
+    findStimulusByConditionKey(conditionKey, CONCLUSION_FORM_BLOCKS.some_a_not_c)
+  );
+
+  const beliefBlocks = cThenA ? [someCBlock, someABlock] : [someABlock, someCBlock];
+  const neutralBlock = neutralOrder.map((problemId) => findStimulusById(problemId));
+
+  const orderedStimuli = neutralFirst
+    ? [...neutralBlock, ...beliefBlocks.flat()]
+    : [...beliefBlocks.flat(), ...neutralBlock];
+
+  return {
+    orderedStimuli,
+    metadata: {
+      presentation_order_method: "latin_square_counterbalancing",
+      counterbalance_index: counterbalanceIndex,
+      belief_condition_order_index: beliefConditionOrderIndex,
+      neutral_order_index: neutralOrderIndex,
+      neutral_block_position: neutralFirst ? "first" : "last",
+      conclusion_block_order: cThenA ? "Some C are not A -> Some A are not C" : "Some A are not C -> Some C are not A",
+    },
+  };
+}
+
+function findStimulusByConditionKey(conditionKey, conclusionForm) {
+  const [beliefType, validity] = conditionKey.split("_");
+  const stimulus = stimuli.find((item) =>
+    item.belief_type === beliefType &&
+    item.validity === validity &&
+    item.conclusion_form === conclusionForm
+  );
+  if (!stimulus) {
+    throw new Error(`Missing stimulus for ${conditionKey} / ${conclusionForm}`);
+  }
+  return stimulus;
+}
+
+function findStimulusById(problemId) {
+  const stimulus = stimuli.find((item) => item.problem_id === problemId);
+  if (!stimulus) throw new Error(`Missing stimulus with problem_id ${problemId}`);
+  return stimulus;
+}
+
 function startExperimentTrials() {
-  trialOrder = shuffle(stimuli);
+  if (!state.assigned_condition || !state.participant_number) {
+    alert("Participant registration is not complete. Please return to the participant information screen and try again.");
+    state.current_screen = PHASES.DEMOGRAPHICS;
+    render();
+    return;
+  }
+
+  const counterbalancedOrder = buildLatinSquareTrialOrder();
+  trialOrder = counterbalancedOrder.orderedStimuli;
+
   state.randomized_trial_order = trialOrder.map(t => t.problem_id);
+  state.presentation_order_method = counterbalancedOrder.metadata.presentation_order_method;
+  state.counterbalance_index = counterbalancedOrder.metadata.counterbalance_index;
+  state.belief_condition_order_index = counterbalancedOrder.metadata.belief_condition_order_index;
+  state.neutral_order_index = counterbalancedOrder.metadata.neutral_order_index;
+  state.neutral_block_position = counterbalancedOrder.metadata.neutral_block_position;
+  state.conclusion_block_order = counterbalancedOrder.metadata.conclusion_block_order;
+
   state.current_trial_position = 0;
   state.trial_data = [];
   state.click_events = [];
@@ -632,10 +972,17 @@ function beginTrial() {
   const stim = getCurrentStimulus();
   const yesLeft = Math.random() < 0.5;
   currentTrialDraft = {
+    participant_number: state.participant_number,
     participant_id: state.participant_id,
     participant_code: state.demographics.participant_code || "",
     session_id: state.session_id,
     assigned_condition: state.assigned_condition,
+    presentation_order_method: state.presentation_order_method,
+    counterbalance_index: state.counterbalance_index,
+    belief_condition_order_index: state.belief_condition_order_index,
+    neutral_order_index: state.neutral_order_index,
+    neutral_block_position: state.neutral_block_position,
+    conclusion_block_order: state.conclusion_block_order,
     trial_index: state.current_trial_position + 1,
     problem_id: stim.problem_id,
     belief_type: stim.belief_type,
@@ -916,6 +1263,7 @@ function finishExperiment(status) {
   clearTimers();
   state.completion_status = status;
   state.experiment_end_time = new Date().toISOString();
+  prepareOutputFilenames();
   state.current_screen = PHASES.END;
   persistSession();
   render();
@@ -935,7 +1283,9 @@ function renderEnd() {
         </div>
         <p class="small">Files download to the browser’s default Downloads folder on this computer.</p>
       </div>
+      <p class="small">Participant number: <strong>${escapeHtml(state.participant_number || "not assigned")}</strong></p>
       <p class="small">Participant code: <strong>${escapeHtml(state.demographics.participant_code || "not provided")}</strong></p>
+      <p class="small">Central Google Sheets sync: <strong>${escapeHtml(state.google_sheets_completion_status || "not_started")}</strong></p>
       <p class="small">Internal session ID: <strong>${escapeHtml(state.session_id)}</strong></p>
     </section>
   `;
@@ -949,6 +1299,7 @@ function renderEnd() {
         downloadFullJson();
         setTimeout(() => downloadTrialCsv(), 500);
         state.download_status = "automatic_download_attempted";
+        syncCompletionToGoogleSheets();
         persistSession();
       } catch (error) {
         console.warn("Automatic download failed", error);
@@ -972,6 +1323,7 @@ function recordMouseSample(phase) {
     : "";
 
   state.mouse_samples.push({
+    participant_number: state.participant_number,
     participant_id: state.participant_id,
     participant_code: state.demographics.participant_code || "",
     session_id: state.session_id,
@@ -1013,6 +1365,7 @@ function registerDocumentListeners() {
     const zone = getZoneAt(event.clientX, event.clientY);
     const currentTrial = getCurrentStimulus();
     state.click_events.push({
+      participant_number: state.participant_number,
       participant_id: state.participant_id,
       participant_code: state.demographics.participant_code || "",
       session_id: state.session_id,
@@ -1163,6 +1516,7 @@ function estimateDwell(samples, zone) {
 function buildFullSessionObject() {
   return {
     app_version: state.app_version,
+    participant_number: state.participant_number,
     participant_id: state.participant_id,
     participant_code: state.demographics.participant_code || "",
     session_id: state.session_id,
@@ -1173,12 +1527,24 @@ function buildFullSessionObject() {
     consent: state.consent,
     demographics: state.demographics,
     randomized_trial_order: state.randomized_trial_order,
+    presentation_order_method: state.presentation_order_method,
+    counterbalance_index: state.counterbalance_index,
+    belief_condition_order_index: state.belief_condition_order_index,
+    neutral_order_index: state.neutral_order_index,
+    neutral_block_position: state.neutral_block_position,
+    conclusion_block_order: state.conclusion_block_order,
     current_trial_position: state.current_trial_position,
     current_screen: state.current_screen,
     browser_info: state.browser_info,
     trial_data: state.trial_data,
     click_events: state.click_events,
     mouse_samples: state.mouse_samples,
+    google_sheets_configured: state.google_sheets_configured,
+    google_sheets_reservation_status: state.google_sheets_reservation_status,
+    google_sheets_completion_status: state.google_sheets_completion_status,
+    google_sheets_error: state.google_sheets_error,
+    full_json_filename: state.full_json_filename,
+    trial_csv_filename: state.trial_csv_filename,
     download_status: state.download_status,
     current_trial_draft: currentTrialDraft,
   };
@@ -1186,10 +1552,17 @@ function buildFullSessionObject() {
 
 function buildTrialCsv() {
   const columns = [
+    "participant_number",
     "participant_id",
     "participant_code",
     "session_id",
     "assigned_condition",
+    "presentation_order_method",
+    "counterbalance_index",
+    "belief_condition_order_index",
+    "neutral_order_index",
+    "neutral_block_position",
+    "conclusion_block_order",
     "trial_index",
     "problem_id",
     "belief_type",
@@ -1259,17 +1632,23 @@ function safeFileLabel() {
   return cleaned || state.participant_id;
 }
 
-function downloadFullJson() {
+function prepareOutputFilenames() {
+  if (state.full_json_filename && state.trial_csv_filename) return;
   const timestamp = formatTimestamp(new Date());
-  const filename = `full_session_${safeFileLabel()}_${timestamp}.json`;
+  const participantPart = state.participant_number ? `N${String(state.participant_number).padStart(3, "0")}_${safeFileLabel()}` : safeFileLabel();
+  state.full_json_filename = `full_session_${participantPart}_${timestamp}.json`;
+  state.trial_csv_filename = `trial_summary_${participantPart}_${timestamp}.csv`;
+}
+
+function downloadFullJson() {
+  prepareOutputFilenames();
   const content = JSON.stringify(buildFullSessionObject(), null, 2);
-  downloadBlob(content, filename, "application/json;charset=utf-8");
+  downloadBlob(content, state.full_json_filename, "application/json;charset=utf-8");
 }
 
 function downloadTrialCsv() {
-  const timestamp = formatTimestamp(new Date());
-  const filename = `trial_summary_${safeFileLabel()}_${timestamp}.csv`;
-  downloadBlob(buildTrialCsv(), filename, "text/csv;charset=utf-8");
+  prepareOutputFilenames();
+  downloadBlob(buildTrialCsv(), state.trial_csv_filename, "text/csv;charset=utf-8");
 }
 
 window.addEventListener("beforeunload", () => {
