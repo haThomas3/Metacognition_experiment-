@@ -1,87 +1,111 @@
 # Syllogistic Reasoning Mouse-Tracking Experiment
 
-Local browser-based experiment for a syllogistic reasoning task with mouse tracking, Latin-square trial ordering, circular countdown timer, and optional central Google Sheets logging.
+Final standalone local browser experiment for a syllogistic reasoning task with mouse tracking, Latin-square trial ordering, fixed participant-code assignment, fixed YES/NO button mapping, first-deadline-only beep, and one ZIP data export.
+
+This version does **not** use Google Sheets, does **not** require an internet connection, and does **not** include a restore/continue-previous-session option.
 
 ## Files
 
-- `index.html` — open this file in a browser to run the experiment.
-- `app.js` — experiment logic, timers, Latin-square order, data collection, CSV/JSON export, Google Sheets sync.
+- `index.html` — open this file in Chrome or Edge to run the experiment.
+- `app.js` — experiment logic, timers, Latin-square order, fixed P001-P020 assignment, mouse tracking, ZIP export.
 - `styles.css` — visual styling.
-- `google_apps_script.gs` — Google Apps Script backend for central Google Sheets logging and balanced condition assignment.
+- `participant_assignment_plan.csv` — researcher-facing assignment table for participant code, condition, YES side, and counterbalance index.
 
-## What the app does
+## Participant-code workflow
+
+Use each code exactly once:
+
+```text
+P001, P002, P003, ..., P020
+```
+
+The participant code controls:
+
+1. time-enforcement condition: soft or strict;
+2. fixed YES/NO button side for the full experiment;
+3. Latin-square trial order.
+
+The app accepts only codes from `P001` to `P020`.
+
+## Assignment plan
+
+The plan gives exactly 10 soft and 10 strict participants, and also avoids a perfect correlation between condition and YES-button side.
+
+| Code | Condition | YES side | NO side |
+|---|---|---|---|
+| P001 | soft | left | right |
+| P002 | strict | left | right |
+| P003 | soft | right | left |
+| P004 | strict | right | left |
+| P005 | soft | left | right |
+| P006 | strict | left | right |
+| P007 | soft | right | left |
+| P008 | strict | right | left |
+| P009 | soft | left | right |
+| P010 | strict | left | right |
+| P011 | soft | right | left |
+| P012 | strict | right | left |
+| P013 | soft | left | right |
+| P014 | strict | left | right |
+| P015 | soft | right | left |
+| P016 | strict | right | left |
+| P017 | strict | left | right |
+| P018 | soft | left | right |
+| P019 | strict | right | left |
+| P020 | soft | right | left |
+
+## Latin-square ordering
+
+Trial order is determined by participant number:
+
+```text
+counterbalance_index = (participant_number - 1) % 16
+```
+
+P001-P016 cover the 16 counterbalanced schedules once. P017-P020 repeat the first four schedules while preserving the final 10/10 condition balance.
+
+The trial-order metadata is saved in the output files:
+
+- `presentation_order_method`
+- `counterbalance_index`
+- `belief_condition_order_index`
+- `neutral_order_index`
+- `neutral_block_position`
+- `conclusion_block_order`
+
+## What the app records
 
 Participants complete 12 syllogistic reasoning trials. For each trial they provide:
 
-1. a first intuitive yes/no answer under a 10-second deadline,
-2. a confidence rating from 1 to 7,
-3. a final yes/no answer after up to 60 seconds,
+1. a first intuitive YES/NO answer under a 10-second deadline;
+2. a confidence rating from 1 to 7;
+3. a final YES/NO answer after up to 60 seconds;
 4. a second confidence rating.
 
-The app records response times, accuracy, confidence ratings, answer changes, click events, and mouse movement samples.
+The app records answers, accuracy, response times, confidence ratings, answer changes, timeout/late/on-time status, fixed button positions, click events, mouse samples every 25 ms, and derived mouse metrics.
 
-## Trial order
+## Output
 
-The experiment uses Latin-square counterbalancing rather than full randomization. Participant order is based on the centrally assigned `participant_number` from the Google Sheet backend.
+At the end of the experiment, the browser downloads one ZIP file:
 
-## Condition assignment
-
-The app no longer requires researchers to choose `soft` or `strict` manually.
-
-When Google Sheets is configured, condition assignment happens centrally in the Apps Script backend:
-
-- initially, conditions are assigned randomly;
-- once one condition reaches 10 participants, new participants are assigned to the other condition;
-- the reservation is protected with `LockService`, so two parallel sessions should not receive the same participant number.
-
-The assigned condition is not shown to participants.
-
-## Data output
-
-At the end of each participant session, the browser still downloads exactly two local files:
-
-1. `full_session_[participant_code]_[timestamp].json`
-2. `trial_summary_[participant_code]_[timestamp].csv`
-
-The Google Sheet receives:
-
-- one row per participant in the `Participants` tab;
-- one row per trial in the `Trials` tab;
-- logging/debug events in the `Logs` tab.
-
-Raw mouse samples are kept in the local JSON file and are not uploaded to Google Sheets, because they can be very large and may exceed practical Google Sheets / Apps Script limits.
-
-## Google Sheets setup
-
-A Google Sheet was prepared with three tabs:
-
-- `Participants`
-- `Trials`
-- `Logs`
-
-To connect the app:
-
-1. Open the Google Sheet.
-2. Go to `Extensions` -> `Apps Script`.
-3. Paste the contents of `google_apps_script.gs` into `Code.gs`.
-4. Click `Deploy` -> `New deployment`.
-5. Choose type: `Web app`.
-6. Set `Execute as`: `Me`.
-7. Set `Who has access`: `Anyone with the link`.
-8. Deploy and copy the Web App URL.
-9. Open `app.js` and replace:
-
-```js
-const GOOGLE_SHEETS_WEB_APP_URL = "PASTE_GOOGLE_APPS_SCRIPT_WEB_APP_URL_HERE";
+```text
+experiment_data_P001.zip
 ```
 
-with the deployed Web App URL.
+Inside the ZIP are two files:
 
-If this URL is not configured, the experiment will stop after the demographic questionnaire and show an error. This prevents accidental local-only data collection when central assignment is required.
+```text
+full_session_P001.json
+trial_summary_P001.csv
+```
+
+The JSON contains the complete session, including raw mouse samples. The CSV contains trial-level summary and derived metrics.
+
+If the automatic ZIP download is blocked, the final screen has one manual button: `Download data ZIP`. Do not close the final screen until the ZIP appears in the Downloads folder.
 
 ## Running locally
 
-Open `index.html` in Chrome or Edge.
+Open `index.html` directly in Chrome or Edge.
 
 For more stable behavior, run a local server from the project folder:
 
@@ -95,24 +119,19 @@ Then open:
 http://localhost:8000
 ```
 
-## Researcher workflow
+## Recommended researcher procedure
 
-1. Configure the Google Apps Script Web App URL in `app.js`.
-2. Open the experiment on the participant's computer.
-3. Participant fills the demographic form.
-4. The app reserves a participant number and condition in the shared Google Sheet.
-5. Participant completes the experiment.
-6. The local JSON and CSV files download.
-7. Participant and trial-summary rows are uploaded to the shared Google Sheet.
-8. Keep the local JSON file as the main backup for raw mouse data.
+1. Assign each participant one unused code from P001-P020.
+2. Mark the code as used in your own tracking sheet.
+3. Run the experiment locally on the participant computer.
+4. At the end, verify that the ZIP file appears in Downloads.
+5. Ask every researcher/participant to send back the ZIP file.
+6. Do not reuse participant codes.
 
-## Important limitations
+## Important operational note
 
-- The local JSON file is still necessary for complete raw mouse-tracking data.
-- Google Sheets is used for central participant/trial tracking and condition balancing, not for raw mouse samples.
-- If the browser is offline or Apps Script is not deployed, participant reservation will fail.
-- If multiple researchers run the experiment in parallel, the Apps Script lock should prevent duplicate participant numbers.
+There is no restore function in this version. If a participant closes the browser before finishing the experiment and downloading the ZIP, that session should be treated as incomplete and should not be resumed.
 
 ## Privacy note
 
-Use anonymous participant codes. Avoid national ID numbers, phone numbers, or other directly identifying information unless explicitly approved.
+Use only anonymous participant codes. Do not ask participants to enter national ID numbers, phone numbers, or other directly identifying information unless explicitly approved.

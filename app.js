@@ -1,19 +1,36 @@
 /*
   Syllogistic Reasoning Mouse-Tracking Experiment
   Local browser-based single-page application.
-  Data are stored in localStorage during the session and downloaded locally at the end.
+  Data are kept in memory during the session and downloaded locally as a ZIP at the end.
 */
 
-const APP_VERSION = "1.4.0";
+const APP_VERSION = "1.6.2";
 
-// Google Sheets integration
-// Paste the deployed Google Apps Script Web App URL here.
-// The included google_apps_script.gs file contains the server code.
-const GOOGLE_SHEETS_WEB_APP_URL = "https://script.google.com/macros/s/AKfycbz2ljtK7mknSoteIR5Nnklcq-oEDLQyp0uu8pE_VziX-bocXHxnSDc90gSMYvgOGRzc-Q/exec";
-const GOOGLE_SHEETS_CONFIGURED = GOOGLE_SHEETS_WEB_APP_URL && !GOOGLE_SHEETS_WEB_APP_URL.includes("PASTE_GOOGLE_APPS_SCRIPT");
-const REQUIRE_GOOGLE_SHEETS_RESERVATION = true;
+// Standalone local mode.
+// No Google Sheets connection is required. Researchers assign participant codes P001-P020 manually.
+const DATA_COLLECTION_MODE = "standalone_local_download";
 
-const STORAGE_KEY_PREFIX = "syllogism_mouse_session_";
+// Fixed 20-participant plan. This guarantees 10 soft and 10 strict sessions
+// when the researcher uses each code P001-P020 exactly once.
+const MAX_STANDALONE_PARTICIPANTS = 20;
+const CONDITION_BY_PARTICIPANT_NUMBER = [
+  "soft", "strict", "soft", "strict",
+  "soft", "strict", "soft", "strict",
+  "soft", "strict", "soft", "strict",
+  "soft", "strict", "soft", "strict",
+  "strict", "soft", "strict", "soft",
+];
+
+// Fixed response-side plan. This keeps YES/NO placement constant for each participant
+// and avoids a perfect correlation between condition and button side.
+const YES_SIDE_BY_PARTICIPANT_NUMBER = [
+  "left", "left", "right", "right",
+  "left", "left", "right", "right",
+  "left", "left", "right", "right",
+  "left", "left", "right", "right",
+  "left", "left", "right", "right",
+];
+
 const PHASES = {
   WELCOME: "welcome",
   CONSENT: "consent",
@@ -204,6 +221,7 @@ let currentTrialDraft = null;
 let currentTrialSamplesStartIndex = 0;
 let trialOrder = [];
 let audioContext = null;
+let audioPrimed = false;
 let latestMouse = {
   x: null,
   y: null,
@@ -212,11 +230,6 @@ let latestMouse = {
 let automaticDownloadAttempted = false;
 
 function makeInitialState() {
-  const params = new URLSearchParams(window.location.search);
-  const requestedCondition = params.get("condition");
-  const forcedCondition = requestedCondition === "soft" || requestedCondition === "strict"
-    ? requestedCondition
-    : null;
   const now = new Date();
   const participantId = `P_${formatTimestamp(now)}_${randomString(5)}`;
   const sessionId = `S_${formatTimestamp(now)}_${randomString(8)}`;
@@ -225,12 +238,12 @@ function makeInitialState() {
     participant_id: participantId,
     session_id: sessionId,
     participant_number: null,
-    assigned_condition: forcedCondition,
-    forced_condition_from_url: forcedCondition,
-    google_sheets_configured: GOOGLE_SHEETS_CONFIGURED,
-    google_sheets_reservation_status: "not_started",
-    google_sheets_completion_status: "not_started",
-    google_sheets_error: "",
+    assigned_condition: null,
+    yes_button_side: null,
+    no_button_side: null,
+    forced_condition_from_url: "",
+    data_collection_mode: DATA_COLLECTION_MODE,
+    standalone_assignment_status: "not_started",
     current_screen: PHASES.WELCOME,
     experiment_start_time: now.toISOString(),
     experiment_end_time: null,
@@ -251,6 +264,7 @@ function makeInitialState() {
     browser_info: getBrowserInfo(),
     full_json_filename: "",
     trial_csv_filename: "",
+    zip_filename: "",
     download_status: "not_started",
   };
 }
@@ -297,45 +311,9 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-function getStorageKey() {
-  return `${STORAGE_KEY_PREFIX}${state.session_id}`;
-}
-
 function persistSession() {
-  try {
-    localStorage.setItem(getStorageKey(), JSON.stringify(buildFullSessionObject()));
-    localStorage.setItem(`${STORAGE_KEY_PREFIX}latest`, state.session_id);
-  } catch (error) {
-    console.warn("Could not save session to localStorage", error);
-  }
-}
-
-function loadLatestSession() {
-  try {
-    const latestSessionId = localStorage.getItem(`${STORAGE_KEY_PREFIX}latest`);
-    if (!latestSessionId) return null;
-    const raw = localStorage.getItem(`${STORAGE_KEY_PREFIX}${latestSessionId}`);
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch (error) {
-    console.warn("Could not load session", error);
-    return null;
-  }
-}
-
-function restoreSession(saved) {
-  if (!saved || !saved.participant_id || !saved.session_id) return;
-  state = {
-    ...state,
-    ...saved,
-    current_screen: saved.current_screen || PHASES.WELCOME,
-  };
-  experimentStartPerfMs = performance.now();
-  trialOrder = state.randomized_trial_order.map((id) => stimuli.find((s) => s.problem_id === id)).filter(Boolean);
-  currentTrialDraft = saved.current_trial_draft || null;
-  currentTrialSamplesStartIndex = state.mouse_samples.findIndex(s => Number(s.trial_index) === Number(state.current_trial_position + 1));
-  if (currentTrialSamplesStartIndex < 0) currentTrialSamplesStartIndex = state.mouse_samples.length;
-  render();
+  // Intentionally no-op in the final standalone version.
+  // Previous-session recovery was removed to prevent corrupted partial-session recovery.
 }
 
 function clearTimers() {
@@ -405,26 +383,26 @@ function render() {
 }
 
 function renderWelcome() {
-  const saved = loadLatestSession();
   app.innerHTML = `
     <section class="screen narrow center">
       <h1>Syllogistic Reasoning Experiment</h1>
       <p>This computerized experiment records answers, confidence ratings, response times, and mouse movements.</p>
       <div class="row center" style="justify-content:center;margin-top:24px;">
         <button id="startBtn" data-zone="start_button">Start new session</button>
-        ${saved && saved.completion_status !== "completed" ? '<button class="secondary" id="restoreBtn" data-zone="restore_button">Restore previous session</button>' : ""}
       </div>
-      <p class="small" style="margin-top:20px;">For local data collection only. Downloaded files are saved on the computer running this experiment.</p>
+      <p class="small" style="margin-top:20px;">Standalone local version. Data are saved only at the end as a ZIP file on this computer.</p>
     </section>
   `;
   document.getElementById("startBtn").addEventListener("click", () => {
-    ensureAudioReady();
+    primeAudio();
+    state = makeInitialState();
+    experimentStartPerfMs = performance.now();
+    currentTrialDraft = null;
+    trialOrder = [];
     state.completion_status = "started";
     state.current_screen = PHASES.CONSENT;
     render();
   });
-  const restoreBtn = document.getElementById("restoreBtn");
-  if (restoreBtn) restoreBtn.addEventListener("click", () => restoreSession(saved));
 }
 
 function renderConsent() {
@@ -456,14 +434,64 @@ function renderConsent() {
   });
 }
 
+
+function validateStandaloneParticipantCode(rawCode) {
+  const normalized = String(rawCode || "").trim().toUpperCase();
+  const match = normalized.match(/^P(\d{3})$/);
+  if (!match) {
+    return { ok: false, message: "Participant code must be in the format P001 to P020." };
+  }
+  const number = parseInt(match[1], 10);
+  if (!Number.isFinite(number) || number < 1 || number > MAX_STANDALONE_PARTICIPANTS) {
+    return { ok: false, message: "Participant code must be between P001 and P020." };
+  }
+  return {
+    ok: true,
+    number,
+    code: `P${String(number).padStart(3, "0")}`,
+    assigned_condition: getAssignedConditionForParticipantNumber(number),
+  };
+}
+
+function getAssignedConditionForParticipantNumber(participantNumber) {
+  const index = Number(participantNumber) - 1;
+  if (!Number.isInteger(index) || index < 0 || index >= CONDITION_BY_PARTICIPANT_NUMBER.length) {
+    throw new Error("Participant number is outside the supported range P001-P020.");
+  }
+  return CONDITION_BY_PARTICIPANT_NUMBER[index];
+}
+
+function getYesButtonSideForParticipantNumber(participantNumber) {
+  const index = Number(participantNumber) - 1;
+  if (!Number.isInteger(index) || index < 0 || index >= YES_SIDE_BY_PARTICIPANT_NUMBER.length) {
+    throw new Error("Participant number is outside the supported range P001-P020.");
+  }
+  return YES_SIDE_BY_PARTICIPANT_NUMBER[index];
+}
+
+function getNoButtonSideFromYesSide(yesSide) {
+  return yesSide === "left" ? "right" : "left";
+}
+
+function showInlineError(message) {
+  const existing = document.getElementById("participantCodeError");
+  if (existing) existing.remove();
+  const errorBox = document.createElement("p");
+  errorBox.id = "participantCodeError";
+  errorBox.className = "error";
+  errorBox.textContent = message;
+  document.querySelector(".screen").appendChild(errorBox);
+}
+
 function renderDemographics() {
   app.innerHTML = `
     <section class="screen">
       <h2>Participant Information</h2>
+      <p class="small"><strong>Researcher note:</strong> use each participant code once only, from P001 to P020. The code determines both the Latin-square order and the soft/strict condition.</p>
       <form id="demoForm" class="form-grid" data-zone="demographics_form">
         <label>Participant code
-          <input name="participant_code" type="text" required placeholder="e.g., P001" />
-          <span class="field-note">Use a researcher-assigned code. Do not enter a national ID unless explicitly required by your course or ethics approval.</span>
+          <input name="participant_code" type="text" required placeholder="P001 to P020" pattern="P[0-9]{3}" />
+          <span class="field-note">Use the researcher-assigned code only. Valid codes: P001-P020.</span>
         </label>
         <label>Age
           <input name="age" type="number" min="18" max="120" required />
@@ -539,200 +567,30 @@ function renderDemographics() {
       </div>
     </section>
   `;
-  document.getElementById("demoForm").addEventListener("submit", async (event) => {
+  document.getElementById("demoForm").addEventListener("submit", (event) => {
     event.preventDefault();
-    const submitButton = event.target.querySelector('button[type="submit"]') || document.querySelector('button[form="demoForm"]');
     const fd = new FormData(event.target);
-    state.demographics = Object.fromEntries(fd.entries());
-    if (submitButton) {
-      submitButton.disabled = true;
-      submitButton.textContent = "Registering...";
+    const demographics = Object.fromEntries(fd.entries());
+    const validation = validateStandaloneParticipantCode(demographics.participant_code);
+    if (!validation.ok) {
+      showInlineError(validation.message);
+      return;
     }
-    try {
-      await reserveParticipantAssignment();
-      state.current_screen = PHASES.INSTRUCTIONS;
-      persistSession();
-      render();
-    } catch (error) {
-      state.google_sheets_error = error.message || String(error);
-      persistSession();
-      const existing = document.getElementById("reservationError");
-      if (existing) existing.remove();
-      const errorBox = document.createElement("p");
-      errorBox.id = "reservationError";
-      errorBox.className = "error";
-      errorBox.textContent = `Could not register this participant in the shared Google Sheet: ${state.google_sheets_error}`;
-      document.querySelector(".screen").appendChild(errorBox);
-      if (submitButton) {
-        submitButton.disabled = false;
-        submitButton.textContent = "Try again";
-      }
-    }
-  });
-}
 
-
-function reserveParticipantAssignment() {
-  if (state.assigned_condition && state.participant_number) {
-    return Promise.resolve({ already_reserved: true });
-  }
-
-  if (!GOOGLE_SHEETS_CONFIGURED) {
-    state.google_sheets_reservation_status = "not_configured";
-    if (REQUIRE_GOOGLE_SHEETS_RESERVATION) {
-      throw new Error("Google Sheets Web App URL is not configured in app.js.");
-    }
-    const fallback = makeLocalFallbackAssignment();
-    applyReservationResponse(fallback);
-    return Promise.resolve(fallback);
-  }
-
-  state.google_sheets_reservation_status = "pending";
-  persistSession();
-
-  const params = {
-    action: "reserve",
-    participant_id: state.participant_id,
-    session_id: state.session_id,
-    forced_condition: state.forced_condition_from_url || "",
-    participant_code: state.demographics.participant_code || "",
-    demographics_json: JSON.stringify(state.demographics || {}),
-    browser_json: JSON.stringify(state.browser_info || {}),
-    app_version: APP_VERSION,
-  };
-
-  return jsonpRequest(GOOGLE_SHEETS_WEB_APP_URL, params).then((response) => {
-    if (!response || response.ok !== true) {
-      throw new Error(response && response.error ? response.error : "Reservation failed.");
-    }
-    applyReservationResponse(response);
-    return response;
-  });
-}
-
-function applyReservationResponse(response) {
-  state.participant_number = Number(response.participant_number) || state.participant_number;
-  state.assigned_condition = response.assigned_condition || state.assigned_condition;
-  state.google_sheets_reservation_status = response.source === "local_fallback" ? "local_fallback" : "reserved";
-  state.google_sheets_error = "";
-  persistSession();
-}
-
-function makeLocalFallbackAssignment() {
-  const fallbackNumber = getParticipantOrderNumberFromCode();
-  const fallbackCondition = state.forced_condition_from_url || (Math.random() < 0.5 ? "soft" : "strict");
-  return {
-    ok: true,
-    source: "local_fallback",
-    participant_number: fallbackNumber,
-    assigned_condition: fallbackCondition,
-  };
-}
-
-function jsonpRequest(baseUrl, params, timeoutMs = 12000) {
-  return new Promise((resolve, reject) => {
-    const callbackName = `gsCallback_${Date.now()}_${randomString(6)}`;
-    const script = document.createElement("script");
-    const url = new URL(baseUrl);
-    Object.entries(params || {}).forEach(([key, value]) => url.searchParams.set(key, value == null ? "" : String(value)));
-    url.searchParams.set("callback", callbackName);
-
-    let done = false;
-    const cleanup = () => {
-      try { delete window[callbackName]; } catch (_) { window[callbackName] = undefined; }
-      if (script.parentNode) script.parentNode.removeChild(script);
-    };
-
-    const timer = setTimeout(() => {
-      if (done) return;
-      done = true;
-      cleanup();
-      reject(new Error("Google Sheets reservation timed out."));
-    }, timeoutMs);
-
-    window[callbackName] = (data) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      cleanup();
-      resolve(data);
-    };
-
-    script.onerror = () => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      cleanup();
-      reject(new Error("Could not reach the Google Sheets Web App."));
-    };
-
-    script.src = url.toString();
-    document.body.appendChild(script);
-  });
-}
-
-function postToGoogleSheets(payload) {
-  if (!GOOGLE_SHEETS_CONFIGURED) return Promise.resolve(false);
-  const body = JSON.stringify(payload);
-
-  if (navigator.sendBeacon) {
-    try {
-      const blob = new Blob([body], { type: "text/plain;charset=utf-8" });
-      const accepted = navigator.sendBeacon(GOOGLE_SHEETS_WEB_APP_URL, blob);
-      if (accepted) return Promise.resolve(true);
-    } catch (error) {
-      console.warn("sendBeacon failed, falling back to fetch", error);
-    }
-  }
-
-  return fetch(GOOGLE_SHEETS_WEB_APP_URL, {
-    method: "POST",
-    mode: "no-cors",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body,
-    keepalive: true,
-  }).then(() => true).catch((error) => {
-    console.warn("Google Sheets POST failed", error);
-    return false;
-  });
-}
-
-function syncCompletionToGoogleSheets() {
-  if (state.google_sheets_completion_status === "upload_attempted" || state.google_sheets_completion_status === "upload_sent") return;
-  if (!GOOGLE_SHEETS_CONFIGURED) {
-    state.google_sheets_completion_status = "not_configured";
+    demographics.participant_code = validation.code;
+    state.demographics = demographics;
+    state.participant_number = validation.number;
+    state.assigned_condition = validation.assigned_condition;
+    state.yes_button_side = getYesButtonSideForParticipantNumber(validation.number);
+    state.no_button_side = getNoButtonSideFromYesSide(state.yes_button_side);
+    state.standalone_assignment_status = "assigned_from_participant_code";
+    state.current_screen = PHASES.INSTRUCTIONS;
     persistSession();
-    return;
-  }
-
-  state.google_sheets_completion_status = "upload_attempted";
-  persistSession();
-
-  const payload = {
-    action: "complete",
-    participant_number: state.participant_number,
-    participant_id: state.participant_id,
-    participant_code: state.demographics.participant_code || "",
-    session_id: state.session_id,
-    assigned_condition: state.assigned_condition,
-    app_version: APP_VERSION,
-    completion_status: state.completion_status,
-    experiment_start_time: state.experiment_start_time,
-    experiment_end_time: state.experiment_end_time,
-    full_json_filename: state.full_json_filename,
-    trial_csv_filename: state.trial_csv_filename,
-    demographics: state.demographics,
-    browser_info: state.browser_info,
-    presentation_order_method: state.presentation_order_method,
-    counterbalance_index: state.counterbalance_index,
-    trial_data: state.trial_data,
-  };
-
-  postToGoogleSheets(payload).then((sent) => {
-    state.google_sheets_completion_status = sent ? "upload_sent" : "upload_failed";
-    persistSession();
+    render();
   });
 }
+
+
 
 function instructionsText() {
   if (state.assigned_condition === "soft") {
@@ -778,7 +636,7 @@ function renderPracticeStart() {
     </section>
   `;
   document.getElementById("startPractice").addEventListener("click", () => {
-    ensureAudioReady();
+    primeAudio();
     startPracticeTrial();
   });
 }
@@ -917,7 +775,7 @@ function findStimulusById(problemId) {
 
 function startExperimentTrials() {
   if (!state.assigned_condition || !state.participant_number) {
-    alert("Participant registration is not complete. Please return to the participant information screen and try again.");
+    alert("Participant code assignment is not complete. Please return to the participant information screen and enter a valid code P001-P020.");
     state.current_screen = PHASES.DEMOGRAPHICS;
     render();
     return;
@@ -963,20 +821,23 @@ function renderTrialStart() {
     </section>
   `;
   document.getElementById("startTrial").addEventListener("click", () => {
-    ensureAudioReady();
+    primeAudio();
     beginTrial();
   });
 }
 
 function beginTrial() {
   const stim = getCurrentStimulus();
-  const yesLeft = Math.random() < 0.5;
+  const yesLeft = state.yes_button_side === "left";
   currentTrialDraft = {
     participant_number: state.participant_number,
     participant_id: state.participant_id,
     participant_code: state.demographics.participant_code || "",
     session_id: state.session_id,
     assigned_condition: state.assigned_condition,
+    participant_yes_button_side: state.yes_button_side,
+    participant_no_button_side: state.no_button_side,
+    response_side_assignment_method: "fixed_by_participant_code",
     presentation_order_method: state.presentation_order_method,
     counterbalance_index: state.counterbalance_index,
     belief_condition_order_index: state.belief_condition_order_index,
@@ -1133,28 +994,39 @@ function handleResponseTimeout(kind) {
   const isFirst = kind === "first";
   const isSoft = state.assigned_condition === "soft";
 
+  // The original syllogism experiment describes a beep only after the 10-second
+  // first-answer deadline. The final-answer 60-second deadline has no beep.
   hideProblemText();
 
   if (isSoft) {
-    playBeep();
-    showWarning("Please respond now.");
+    if (isFirst) {
+      playBeep();
+      showWarning("Please respond now.");
+    }
     return;
   }
 
   // Strict condition: timeout ends the current phase/trial.
-  playBeep();
   stopPhaseTracking();
-  if (activeTimer) clearInterval(activeTimer);
+  if (activeTimer) {
+    clearInterval(activeTimer);
+    activeTimer = null;
+  }
 
   if (isFirst) {
     currentTrialDraft.response1_status = "timeout";
     currentTrialDraft.trial_completed = false;
-    finalizeTrialAndMoveNext();
-  } else {
-    currentTrialDraft.response2_status = "timeout";
-    currentTrialDraft.trial_completed = false;
-    finalizeTrialAndMoveNext();
+    // Short delay keeps the 10-second first-answer beep audible before advancing.
+    playBeep();
+    setTimeout(() => {
+      finalizeTrialAndMoveNext();
+    }, 260);
+    return;
   }
+
+  currentTrialDraft.response2_status = "timeout";
+  currentTrialDraft.trial_completed = false;
+  finalizeTrialAndMoveNext();
 }
 
 function hideProblemText() {
@@ -1273,45 +1145,41 @@ function renderEnd() {
   app.innerHTML = `
     <section class="screen narrow center">
       <h1>Thank you.</h1>
-      <p>The experiment is complete.</p>
-      <p id="downloadStatus" class="small">Your data files are being downloaded. If the download does not start automatically, use the buttons below.</p>
-      <div class="download-panel">
-        <h3>Manual backup downloads</h3>
-        <div class="row" style="justify-content:center;">
-          <button id="downloadJson" data-zone="download_json_button">Download full JSON</button>
-          <button id="downloadCsv" data-zone="download_csv_button">Download trial summary CSV</button>
-        </div>
-        <p class="small">Files download to the browser’s default Downloads folder on this computer.</p>
+      <p>The experiment is complete. Thank you for taking part.</p>
+      <div class="warning-panel" id="downloadStatus" data-zone="download_warning">
+        <strong>Do not close this page until the ZIP file appears in your Downloads folder.</strong><br />
+        If the download did not work, click “Download data ZIP”.
       </div>
-      <p class="small">Participant number: <strong>${escapeHtml(state.participant_number || "not assigned")}</strong></p>
+      <div class="download-panel">
+        <h3>Data download</h3>
+        <div class="row" style="justify-content:center;">
+          <button id="downloadZip" class="primary-download" data-zone="download_zip_button">Download data ZIP</button>
+        </div>
+        <p class="small">The ZIP file contains both the full JSON file and the trial-summary CSV file.</p>
+      </div>
       <p class="small">Participant code: <strong>${escapeHtml(state.demographics.participant_code || "not provided")}</strong></p>
-      <p class="small">Central Google Sheets sync: <strong>${escapeHtml(state.google_sheets_completion_status || "not_started")}</strong></p>
       <p class="small">Internal session ID: <strong>${escapeHtml(state.session_id)}</strong></p>
     </section>
   `;
-  document.getElementById("downloadJson").addEventListener("click", () => downloadFullJson());
-  document.getElementById("downloadCsv").addEventListener("click", () => downloadTrialCsv());
+  document.getElementById("downloadZip").addEventListener("click", () => downloadDataZip("manual"));
 
   if (!automaticDownloadAttempted) {
     automaticDownloadAttempted = true;
     setTimeout(() => {
       try {
-        downloadFullJson();
-        setTimeout(() => downloadTrialCsv(), 500);
-        state.download_status = "automatic_download_attempted";
-        syncCompletionToGoogleSheets();
-        persistSession();
+        downloadDataZip("automatic");
       } catch (error) {
-        console.warn("Automatic download failed", error);
+        console.warn("Automatic ZIP download failed", error);
         const statusEl = document.getElementById("downloadStatus");
         if (statusEl) {
-          statusEl.textContent = "Automatic download may have been blocked by your browser. Please use the manual download buttons below.";
+          statusEl.innerHTML = `<strong>Automatic download may have been blocked.</strong><br />Please click “Download data ZIP” before closing this page.`;
           statusEl.classList.add("error");
         }
       }
     }, 600);
   }
 }
+
 
 function recordMouseSample(phase) {
   const now = performance.now();
@@ -1389,23 +1257,65 @@ function ensureAudioReady() {
       audioContext = null;
     }
   }
-  if (audioContext && audioContext.state === "suspended") {
-    audioContext.resume().catch(() => {});
+
+  if (!audioContext) return Promise.resolve(false);
+
+  if (audioContext.state === "suspended") {
+    return audioContext.resume()
+      .then(() => audioContext.state === "running")
+      .catch(() => false);
   }
+
+  return Promise.resolve(audioContext.state === "running");
+}
+
+function primeAudio() {
+  return ensureAudioReady().then((ready) => {
+    if (!ready || !audioContext || audioPrimed) return false;
+
+    try {
+      const buffer = audioContext.createBuffer(1, 1, 22050);
+      const source = audioContext.createBufferSource();
+      const gain = audioContext.createGain();
+      gain.gain.value = 0.00001;
+      source.buffer = buffer;
+      source.connect(gain);
+      gain.connect(audioContext.destination);
+      source.start(0);
+      audioPrimed = true;
+      return true;
+    } catch (error) {
+      console.warn("Could not prime audio", error);
+      return false;
+    }
+  });
 }
 
 function playBeep() {
-  ensureAudioReady();
-  if (!audioContext) return;
-  const oscillator = audioContext.createOscillator();
-  const gain = audioContext.createGain();
-  oscillator.type = "sine";
-  oscillator.frequency.value = 880;
-  gain.gain.value = 0.08;
-  oscillator.connect(gain);
-  gain.connect(audioContext.destination);
-  oscillator.start();
-  oscillator.stop(audioContext.currentTime + 0.18);
+  ensureAudioReady().then((ready) => {
+    if (!ready || !audioContext) return;
+
+    try {
+      const oscillator = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      const now = audioContext.currentTime;
+
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(880, now);
+      oscillator.frequency.setValueAtTime(660, now + 0.11);
+
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.12, now + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.24);
+
+      oscillator.connect(gain);
+      gain.connect(audioContext.destination);
+      oscillator.start(now);
+      oscillator.stop(now + 0.26);
+    } catch (error) {
+      console.warn("Could not play timeout beep", error);
+    }
+  });
 }
 
 function computeDerivedMetrics(samples) {
@@ -1521,6 +1431,9 @@ function buildFullSessionObject() {
     participant_code: state.demographics.participant_code || "",
     session_id: state.session_id,
     assigned_condition: state.assigned_condition,
+    yes_button_side: state.yes_button_side,
+    no_button_side: state.no_button_side,
+    response_side_assignment_method: "fixed_by_participant_code",
     experiment_start_time: state.experiment_start_time,
     experiment_end_time: state.experiment_end_time,
     completion_status: state.completion_status,
@@ -1539,12 +1452,11 @@ function buildFullSessionObject() {
     trial_data: state.trial_data,
     click_events: state.click_events,
     mouse_samples: state.mouse_samples,
-    google_sheets_configured: state.google_sheets_configured,
-    google_sheets_reservation_status: state.google_sheets_reservation_status,
-    google_sheets_completion_status: state.google_sheets_completion_status,
-    google_sheets_error: state.google_sheets_error,
+    data_collection_mode: state.data_collection_mode,
+    standalone_assignment_status: state.standalone_assignment_status,
     full_json_filename: state.full_json_filename,
     trial_csv_filename: state.trial_csv_filename,
+    zip_filename: state.zip_filename,
     download_status: state.download_status,
     current_trial_draft: currentTrialDraft,
   };
@@ -1557,6 +1469,9 @@ function buildTrialCsv() {
     "participant_code",
     "session_id",
     "assigned_condition",
+    "participant_yes_button_side",
+    "participant_no_button_side",
+    "response_side_assignment_method",
     "presentation_order_method",
     "counterbalance_index",
     "belief_condition_order_index",
@@ -1613,8 +1528,42 @@ function csvEscape(value) {
   return str;
 }
 
+function safeFileLabel() {
+  const raw = state.demographics.participant_code || state.participant_id;
+  const cleaned = String(raw).trim().replace(/[^a-zA-Z0-9_-]/g, "_");
+  return cleaned || state.participant_id;
+}
+
+function prepareOutputFilenames() {
+  if (state.full_json_filename && state.trial_csv_filename && state.zip_filename) return;
+  const label = safeFileLabel();
+  state.full_json_filename = `full_session_${label}.json`;
+  state.trial_csv_filename = `trial_summary_${label}.csv`;
+  state.zip_filename = `experiment_data_${label}.zip`;
+}
+
+function buildFullJsonContent() {
+  prepareOutputFilenames();
+  return JSON.stringify(buildFullSessionObject(), null, 2);
+}
+
+function buildTrialCsvContent() {
+  prepareOutputFilenames();
+  return buildTrialCsv();
+}
+
+function downloadDataZip(mode = "manual") {
+  prepareOutputFilenames();
+  state.download_status = mode === "automatic" ? "automatic_zip_download_attempted" : "manual_zip_download_attempted";
+  const zipBlob = createZipBlob([
+    { name: state.full_json_filename, content: buildFullJsonContent(), mimeType: "application/json;charset=utf-8" },
+    { name: state.trial_csv_filename, content: buildTrialCsvContent(), mimeType: "text/csv;charset=utf-8" },
+  ]);
+  downloadBlob(zipBlob, state.zip_filename, "application/zip");
+}
+
 function downloadBlob(content, filename, mimeType) {
-  const blob = new Blob([content], { type: mimeType });
+  const blob = content instanceof Blob ? content : new Blob([content], { type: mimeType });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
@@ -1626,34 +1575,114 @@ function downloadBlob(content, filename, mimeType) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-function safeFileLabel() {
-  const raw = state.demographics.participant_code || state.participant_id;
-  const cleaned = String(raw).trim().replace(/[^a-zA-Z0-9_-]/g, "_");
-  return cleaned || state.participant_id;
+function createZipBlob(files) {
+  const encoder = new TextEncoder();
+  const chunks = [];
+  const centralDirectory = [];
+  let offset = 0;
+  const now = new Date();
+  const dosTime = getDosTime(now);
+  const dosDate = getDosDate(now);
+
+  for (const file of files) {
+    const nameBytes = encoder.encode(file.name);
+    const dataBytes = typeof file.content === "string" ? encoder.encode(file.content) : new Uint8Array(file.content);
+    const crc = crc32(dataBytes);
+    const localHeader = new Uint8Array(30 + nameBytes.length);
+    const localView = new DataView(localHeader.buffer);
+    localView.setUint32(0, 0x04034b50, true);
+    localView.setUint16(4, 20, true);
+    localView.setUint16(6, 0x0800, true); // UTF-8 file names
+    localView.setUint16(8, 0, true); // no compression
+    localView.setUint16(10, dosTime, true);
+    localView.setUint16(12, dosDate, true);
+    localView.setUint32(14, crc, true);
+    localView.setUint32(18, dataBytes.length, true);
+    localView.setUint32(22, dataBytes.length, true);
+    localView.setUint16(26, nameBytes.length, true);
+    localView.setUint16(28, 0, true);
+    localHeader.set(nameBytes, 30);
+
+    chunks.push(localHeader, dataBytes);
+
+    const centralHeader = new Uint8Array(46 + nameBytes.length);
+    const centralView = new DataView(centralHeader.buffer);
+    centralView.setUint32(0, 0x02014b50, true);
+    centralView.setUint16(4, 20, true);
+    centralView.setUint16(6, 20, true);
+    centralView.setUint16(8, 0x0800, true);
+    centralView.setUint16(10, 0, true);
+    centralView.setUint16(12, dosTime, true);
+    centralView.setUint16(14, dosDate, true);
+    centralView.setUint32(16, crc, true);
+    centralView.setUint32(20, dataBytes.length, true);
+    centralView.setUint32(24, dataBytes.length, true);
+    centralView.setUint16(28, nameBytes.length, true);
+    centralView.setUint16(30, 0, true);
+    centralView.setUint16(32, 0, true);
+    centralView.setUint16(34, 0, true);
+    centralView.setUint16(36, 0, true);
+    centralView.setUint32(38, 0, true);
+    centralView.setUint32(42, offset, true);
+    centralHeader.set(nameBytes, 46);
+    centralDirectory.push(centralHeader);
+
+    offset += localHeader.length + dataBytes.length;
+  }
+
+  const centralDirectoryOffset = offset;
+  const centralDirectorySize = centralDirectory.reduce((sum, item) => sum + item.length, 0);
+  chunks.push(...centralDirectory);
+
+  const endRecord = new Uint8Array(22);
+  const endView = new DataView(endRecord.buffer);
+  endView.setUint32(0, 0x06054b50, true);
+  endView.setUint16(4, 0, true);
+  endView.setUint16(6, 0, true);
+  endView.setUint16(8, files.length, true);
+  endView.setUint16(10, files.length, true);
+  endView.setUint32(12, centralDirectorySize, true);
+  endView.setUint32(16, centralDirectoryOffset, true);
+  endView.setUint16(20, 0, true);
+  chunks.push(endRecord);
+
+  return new Blob(chunks, { type: "application/zip" });
 }
 
-function prepareOutputFilenames() {
-  if (state.full_json_filename && state.trial_csv_filename) return;
-  const timestamp = formatTimestamp(new Date());
-  const participantPart = state.participant_number ? `N${String(state.participant_number).padStart(3, "0")}_${safeFileLabel()}` : safeFileLabel();
-  state.full_json_filename = `full_session_${participantPart}_${timestamp}.json`;
-  state.trial_csv_filename = `trial_summary_${participantPart}_${timestamp}.csv`;
+function getDosTime(date) {
+  return (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
 }
 
-function downloadFullJson() {
-  prepareOutputFilenames();
-  const content = JSON.stringify(buildFullSessionObject(), null, 2);
-  downloadBlob(content, state.full_json_filename, "application/json;charset=utf-8");
+function getDosDate(date) {
+  return ((date.getFullYear() - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
 }
 
-function downloadTrialCsv() {
-  prepareOutputFilenames();
-  downloadBlob(buildTrialCsv(), state.trial_csv_filename, "text/csv;charset=utf-8");
+function makeCrcTable() {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) {
+      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[i] = c >>> 0;
+  }
+  return table;
 }
 
-window.addEventListener("beforeunload", () => {
-  persistSession();
-});
+const CRC_TABLE = makeCrcTable();
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) {
+    crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+
+document.addEventListener("pointerdown", () => {
+  primeAudio();
+}, { once: true, capture: true });
 
 registerDocumentListeners();
 render();

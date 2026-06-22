@@ -295,3 +295,19 @@ pre {
     font-size: 1.65rem;
   }
 }
+
+.warning-panel {
+  border: 2px solid var(--danger);
+  border-radius: 12px;
+  padding: 16px;
+  background: #fff7f7;
+  color: var(--danger);
+  line-height: 1.45;
+  margin: 18px 0;
+}
+
+.primary-download {
+  font-size: 1.08rem;
+  font-weight: 800;
+  min-width: 220px;
+}
